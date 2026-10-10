@@ -480,6 +480,16 @@ ensureRocketBootstrap()
 
 const registeredTags = new Set<string>()
 const rocketManifestRegistry = new Map<string, RocketComponentManifest>()
+type HotRocketDefinition = {
+  setup?: (context: any) => void
+  render?: (context: any, ...args: any[]) => RocketRenderValue
+  onFirstRender?: (context: any) => void
+  renderOnPropChange?: boolean | ((context: any) => boolean)
+  props?: unknown
+  mode?: RocketDefinition['mode']
+}
+const hotDefs = new Map<string, HotRocketDefinition>()
+const liveHosts = new Map<string, Set<HTMLElement>>()
 const namedInstanceCounts = new Map<string, number>()
 let nextInstanceId = 0
 
@@ -554,6 +564,29 @@ registerAction({
   },
 })
 
+const hotSwap = (tag: string, options: RocketDefinition<any, any>) => {
+  const def = hotDefs.get(tag)
+  if (!def) return
+  if (String(options.props) !== String(def.props) || options.mode !== def.mode) {
+    document.dispatchEvent(
+      new CustomEvent('rocket:reload-required', { detail: { tag } }),
+    )
+    return
+  }
+
+  def.setup = options.setup
+  def.render = options.render
+  def.onFirstRender = options.onFirstRender
+  def.renderOnPropChange = options.renderOnPropChange
+  for (const host of [...(liveHosts.get(tag) ?? [])]) {
+    const parent = host.parentNode
+    if (!parent) continue
+    const next = host.nextSibling
+    host.remove()
+    parent.insertBefore(host, next)
+  }
+}
+
 // Register a custom element tag and wire its props, setup, render, and Datastar bridge into the element class.
 export function rocket<
   Refs extends RefCtors = RefCtors,
@@ -562,7 +595,10 @@ export function rocket<
   if (!tag) return
   if (!isDocumentObserverActive()) {
     const existing = customElements.get(tag)
-    if (existing) return existing
+    if (existing) {
+      hotSwap(tag, (options ?? {}) as RocketDefinition<any, any>)
+      return existing
+    }
     rocketTags.set(tag, options?.mode ?? 'open')
     markPendingRocketHosts(document)
     pendingRocketDefinitions.set(
@@ -583,8 +619,18 @@ export function rocket<
   } = options ?? {}
   if (registeredTags.has(tag) || customElements.get(tag)) {
     registeredTags.add(tag)
+    hotSwap(tag, (options ?? {}) as RocketDefinition<any, any>)
     return customElements.get(tag)
   }
+  const def: HotRocketDefinition = {
+    setup,
+    render,
+    onFirstRender,
+    renderOnPropChange,
+    props,
+    mode,
+  }
+  hotDefs.set(tag, def)
   registeredTags.add(tag)
   rocketTags.set(tag, mode ?? 'open')
   markPendingRocketHosts(document)
@@ -999,13 +1045,13 @@ export function rocket<
 
       // Notify prop observers synchronously, then optionally queue a render so a burst of writes still collapses into one render.
       if (
-        typeof renderOnPropChange === 'function'
-          ? renderOnPropChange({
+        typeof def.renderOnPropChange === 'function'
+          ? def.renderOnPropChange({
               host: this as RocketHostWithProps<InferProps<Defs>>,
               props: this.#props,
               changes,
             })
-          : renderOnPropChange !== false
+          : def.renderOnPropChange !== false
       ) {
         this.#queueRender()
       }
@@ -1114,7 +1160,7 @@ export function rocket<
       overrides: RenderContextOverrides<InferProps<Defs>>,
       ...args: any[]
     ) {
-      if (!render) {
+      if (!def.render) {
         this.#indexActionHosts()
         return
       }
@@ -1123,7 +1169,7 @@ export function rocket<
         this.#conditionalCleanups.length = 0
       }
       const rendered = (
-        render as (
+        def.render as (
           context: RenderContext<InferProps<Defs>>,
           ...args: any[]
         ) => RocketRenderValue
@@ -1199,6 +1245,12 @@ export function rocket<
     connectedCallback() {
       if (this.#mounted) return
       this.#mounted = true
+      let hosts = liveHosts.get(tag)
+      if (!hosts) {
+        hosts = new Set()
+        liveHosts.set(tag, hosts)
+      }
+      hosts.add(this)
       this.addEventListener(
         DATASTAR_SCOPE_CHILDREN_EVENT,
         this.#scopePatchedChildren,
@@ -1509,7 +1561,7 @@ export function rocket<
         refs: refs as unknown as InstancesOf<Refs>,
       }
 
-      setup?.(context)
+      def.setup?.(context)
       this.#render({})
       if (this.#needsSignalPathBase) {
         mergePaths([[this.#signalPathBase, {}]], { ifMissing: true })
@@ -1549,7 +1601,7 @@ export function rocket<
       }
       this.#cleanups.push(() => refsObserver.disconnect())
       this.#indexActionHosts()
-      onFirstRender?.(firstUpdateContext)
+      def.onFirstRender?.(firstUpdateContext)
     }
 
     attributeChangedCallback(
@@ -1577,6 +1629,9 @@ export function rocket<
     }
 
     disconnectedCallback() {
+      const hosts = liveHosts.get(tag)
+      hosts?.delete(this)
+      if (hosts?.size === 0) liveHosts.delete(tag)
       mergePaths([[this.#signalPathBase, null]])
       this.removeEventListener(
         DATASTAR_SCOPE_CHILDREN_EVENT,
